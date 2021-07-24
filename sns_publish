@@ -1,0 +1,146 @@
+Parameters:
+  EmailId:
+    Type: String
+    Default: myemail@gmail.com  
+    Description: Create an Instance Tag key "NoTerminate" if you want it to be whitelisted from email report
+  CronExpression:
+    Type: String
+    Description: "sends email at 4:00PM IST everyday. Set the time in UTC"
+    Default: "cron(30 10 * * ? *)"
+
+Resources:
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: !Ref CronExpression
+      State: "ENABLED"
+      Targets:
+        -
+          Arn:
+            Fn::GetAtt:
+              - "LambdaFunction"
+              - "Arn"
+          Id: "TargetFunctionV1"
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref "LambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "ScheduledRule"
+          - "Arn"
+
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Code to fetch instance and publish instance details to SNS
+      Handler: index.handler
+      Role: !GetAtt 'LambdaFunctionPermssion.Arn'
+      Timeout: 60
+      Runtime: python3.8
+      Code:
+        ZipFile:
+          !Sub |
+            import boto3
+            import json
+
+            sns_topic_arn = "${SNSTopic}"
+
+            ec2 = boto3.client('ec2')
+            regions = ec2.describe_regions()['Regions']
+
+            message = {}
+            def handler(event, context):
+              for region in regions:
+
+                  my_session = boto3.session.Session(region_name=region['RegionName'])
+
+
+                  ec2 = my_session.client('ec2')
+                  sns = boto3.client('sns')
+
+                  instances = ec2.describe_instances(Filters=[
+                                    {
+                                        'Name': 'instance-state-code',
+                                        'Values': [
+                                            '0', '16', '64', '80'
+                                        ]
+                                    },
+                                ])['Reservations']
+                  if instances:
+                       for instance in instances:
+                           for inst in instance['Instances']:
+                               b = 0
+                               if "Tags" in inst:
+                                   for k in inst['Tags']:
+                                       if "Patch Group"  in k['Key']:
+                                           b = b+1
+                               if b == 0:
+                                   message[inst['InstanceId'] ] =  inst['Placement']['AvailabilityZone'] + ' | ' + inst['InstanceType']
+
+              response = sns.publish(
+                  TargetArn=sns_topic_arn,
+                  Message=json.dumps({'default': json.dumps(message)}),
+                  MessageStructure='json',
+                  # MessageAttributes={
+                  #     'foo': {
+                  #         'DataType': 'String',
+                  #         'StringValue': 'bar'
+                  #     }
+                  # },
+              )
+
+              print(message)
+
+  LambdaFunctionPermssion:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: lambda-perm
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - sns:Publish
+                Resource:
+                  - '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  SNSTopic:
+    Type: 'AWS::SNS::Topic'
+  SNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref EmailId
+      Protocol: email
+      TopicArn: !Ref 'SNSTopic'
+  SNSTopicPolicy:
+      Type: AWS::SNS::TopicPolicy
+      Properties:
+        Topics:
+        - !Ref SNSTopic
+        PolicyDocument:
+          Statement:
+          - Action: 'sns:Publish'
+            Sid : '1'
+            Effect: Allow
+            Resource: !Sub "${SNSTopic}"
+            Principal:
+              AWS: !GetAtt  LambdaFunctionPermssion.Arn
